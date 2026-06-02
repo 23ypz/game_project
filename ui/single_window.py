@@ -1,7 +1,7 @@
 import copy
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
@@ -43,7 +43,7 @@ class SinglePlayerWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("多边形游戏 - 单人模式")
-        self.resize(1280, 760)
+        self.resize(1280, 800)
 
         self.raw_values: List[int] = [3, -2, 5, 4]
         self.raw_ops: List[str] = ["+", "*", "+", "*"]
@@ -475,12 +475,53 @@ class SinglePlayerWindow(QMainWindow):
         self.dp_solution = None
         self.refresh_ui()
 
+    def _animate_delete(self, edge_index: int, source: str = "手动", record_undo: bool = True, on_done: Optional[Callable[[], None]] = None) -> None:
+        self.canvas.stop_all_animations()
+        old_points = self.canvas.current_points()
+        def after_flash_delete():
+            self.delete_edge(edge_index, record_undo=record_undo, source=source)
+            self.canvas.start_transition_after_delete(old_points, edge_index, duration_ms=420, finished=on_done)
+        self.canvas.start_flash_on_edge(edge_index, cycles=6, interval_ms=70, finished=after_flash_delete)
+
+    def _animate_merge(self, edge_index: int, source: str = "手动", record_undo: bool = True, on_done: Optional[Callable[[], None]] = None) -> None:
+        self.canvas.stop_all_animations()
+        old_points = self.canvas.current_points()
+        if edge_index < 0 or edge_index >= len(self.edge_ids):
+            if on_done: on_done()
+            return
+        target_original_edge = self.edge_ids[edge_index]
+        
+        def after_collapse():
+            if target_original_edge in self.edge_ids:
+                current_index = self.edge_ids.index(target_original_edge)
+            else:
+                current_index = min(edge_index, max(0, len(self.ops) - 1))
+            self.merge_edge(current_index, record_undo=record_undo, source=source)
+            
+            collapsed_pts = self.canvas.get_last_collapse_points()
+            if len(collapsed_pts) > len(self.values):
+                j = (current_index + 1) % len(collapsed_pts) if not self.is_chain else current_index + 1
+                if j >= len(collapsed_pts):
+                    j = len(collapsed_pts) - 1
+                collapsed_pts.pop(j)
+                
+            self.canvas.start_transition_to_current(collapsed_pts, duration_ms=520, ease="outback", finished=on_done)
+            
+        def after_flash_merge():
+            if target_original_edge in self.edge_ids:
+                current_index = self.edge_ids.index(target_original_edge)
+            else:
+                current_index = edge_index
+            self.canvas.start_collapse_two_vertices(old_points, current_index, duration_ms=280, ease="inout", finished=after_collapse)
+            
+        self.canvas.start_flash_on_edge(edge_index, cycles=6, interval_ms=70, finished=after_flash_merge)
+
     def on_edge_clicked(self, edge_index: int) -> None:
         self.demo_timer.stop()
         if not self.is_chain:
-            self.delete_edge(edge_index)
+            self._animate_delete(edge_index, source="手动", record_undo=True)
         else:
-            self.merge_edge(edge_index)
+            self._animate_merge(edge_index, source="手动", record_undo=True)
 
     def delete_edge(self, edge_index: int, record_undo: bool = True, source: str = "手动") -> None:
         if self.is_chain:
@@ -520,8 +561,8 @@ class SinglePlayerWindow(QMainWindow):
         if len(self.values) <= 1:
             return
 
-        if edge_index < 0 or edge_index >= len(self.ops):
-            QMessageBox.warning(self, "操作错误", "边编号不合法")
+        if edge_index < 0 or edge_index >= len(self.values) - 1:
+            QMessageBox.warning(self, "操作错误", f"边编号不合法 {edge_index}")
             return
 
         if record_undo:
@@ -628,11 +669,12 @@ class SinglePlayerWindow(QMainWindow):
 
         sol = self.dp_solution
         self.demo_timer.stop()
+        self.canvas.stop_all_animations()
         self.reset_game()
-        self.delete_edge(sol.delete_edge, record_undo=False, source="演示")
         self.demo_edges = sol.merge_edge_ids[:]
         self.result_text.append("\\n开始自动演示最优方案...")
-        self.demo_timer.start(900)
+        
+        self._animate_delete(sol.delete_edge, source="演示", record_undo=False, on_done=self._demo_next_step_animated)
 
     def start_demo_with_change(self) -> None:
         try:
@@ -640,6 +682,7 @@ class SinglePlayerWindow(QMainWindow):
             sol = changed.base_solution
 
             self.demo_timer.stop()
+            self.canvas.stop_all_animations()
             self.reset_game()
 
             current_edge_index = self.edge_ids.index(changed.change_edge)
@@ -647,7 +690,6 @@ class SinglePlayerWindow(QMainWindow):
             self.change_op_combo.setCurrentText(changed.new_op)
             self.change_edge_symbol()
 
-            self.delete_edge(sol.delete_edge, record_undo=False, source="演示")
             self.demo_edges = sol.merge_edge_ids[:]
             self.result_text.setText(
                 f"【演示修改一次后的 max】\n"
@@ -655,12 +697,17 @@ class SinglePlayerWindow(QMainWindow):
                 f"最高得分：{changed.max_score}\n"
                 f"开始自动演示..."
             )
-            self.demo_timer.start(900)
+            
+            self._animate_delete(sol.delete_edge, source="演示", record_undo=False, on_done=self._demo_next_step_animated)
 
         except Exception as e:
             QMessageBox.warning(self, "演示失败", str(e))
 
-    def _demo_next_step(self) -> None:
+    def _demo_next_step_animated(self) -> None:
+        # Give a small pause between steps to make the demo feel natural
+        QTimer.singleShot(400, self._demo_process_next)
+
+    def _demo_process_next(self) -> None:
         if not self.demo_edges:
             self.demo_timer.stop()
             if self.values:
@@ -679,7 +726,11 @@ class SinglePlayerWindow(QMainWindow):
             return
 
         current_index = self.edge_ids.index(target_original_edge)
-        self.merge_edge(current_index, record_undo=False, source="演示")
+        self._animate_merge(current_index, source="演示", record_undo=False, on_done=self._demo_next_step_animated)
+
+    def _demo_next_step(self) -> None:
+        # Compatibility signature fallback, though now replaced by the animated version above
+        self._demo_process_next()
 
     def refresh_ui(self) -> None:
         self.canvas.set_state(
